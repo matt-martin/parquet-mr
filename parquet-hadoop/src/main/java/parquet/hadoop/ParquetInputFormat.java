@@ -79,7 +79,6 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
   public static final String UNBOUND_RECORD_FILTER = "parquet.read.filter";
 
   private Class<?> readSupportClass;
-  private List<Footer> footers;
 
   public static void setReadSupportClass(Job job,  Class<?> readSupportClass) {
     ContextUtil.getConfiguration(job).set(READ_SUPPORT_CLASS, readSupportClass.getName());
@@ -439,11 +438,7 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
    * @throws IOException
    */
   public List<Footer> getFooters(JobContext jobContext) throws IOException {
-    if (footers == null) {
-      footers = getFooters(ContextUtil.getConfiguration(jobContext), listStatus(jobContext));
-    }
-
-    return footers;
+    return getFooters(ContextUtil.getConfiguration(jobContext), listStatus(jobContext));
   }
 
   /**
