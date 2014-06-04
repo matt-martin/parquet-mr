@@ -29,6 +29,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -74,6 +75,16 @@ public class ParquetFileReader implements Closeable {
 
   private static final Log LOG = Log.getLog(ParquetFileReader.class);
 
+  private static final LinkedHashMap<Path, FooterCacheEntry> footerCache =
+          new LinkedHashMap<Path, FooterCacheEntry>(16, 0.75f, true) {
+            private static final int MAX_ENTRIES = 100;
+
+            @Override
+            public boolean removeEldestEntry(Map.Entry<Path,FooterCacheEntry> eldest) {
+               return size() > MAX_ENTRIES;
+            }
+          };
+
   private static ParquetMetadataConverter parquetMetadataConverter = new ParquetMetadataConverter();
 
   /**
@@ -101,18 +112,42 @@ public class ParquetFileReader implements Closeable {
           // fileSystem is thread-safe
           FileSystem fileSystem = path.getFileSystem(configuration);
           Path summaryFile = new Path(path, PARQUET_METADATA_FILE);
-          if (fileSystem.exists(summaryFile)) {
+          if (!fileSystem.exists(summaryFile)) {
+            // remove the cache entry if it exists
+            synchronized (footerCache) {
+              footerCache.remove(summaryFile);
+            }
+            return Collections.emptyMap();
+          }
+
+          FileStatus summaryFileStatus = fileSystem.getFileStatus(summaryFile);
+          FooterCacheEntry cacheEntry;
+          synchronized (footerCache) {
+            cacheEntry = footerCache.get(summaryFile);
+            if (cacheEntry == null) {
+              // insert a "dummy" summary file to use for synchronization
+              cacheEntry = new FooterCacheEntry(summaryFileStatus);
+              footerCache.put(summaryFile, cacheEntry);
+            }
+          }
+
+          synchronized (cacheEntry) {
+            if (cacheEntry.getModificationTime() >= summaryFileStatus.getModificationTime() && !cacheEntry.isEmpty()) {
+              return cacheEntry.getFooterMap();
+            }
+
             if (Log.INFO) LOG.info("reading summary file: " + summaryFile);
-            final List<Footer> footers = readSummaryFile(configuration, fileSystem.getFileStatus(summaryFile));
+            final List<Footer> footers = readSummaryFile(configuration, summaryFileStatus);
             Map<Path, Footer> map = new HashMap<Path, Footer>();
             for (Footer footer : footers) {
               // the folder may have been moved
               footer = new Footer(new Path(path, footer.getFile().getName()), footer.getParquetMetadata());
               map.put(footer.getFile(), footer);
             }
+            synchronized (footerCache) {
+              footerCache.put(summaryFile, new FooterCacheEntry(summaryFileStatus, map));
+            }
             return map;
-          } else {
-            return Collections.emptyMap();
           }
         }
       });
@@ -370,6 +405,7 @@ public class ParquetFileReader implements Closeable {
 
   @Override
   public void close() throws IOException {
+    footerCache.clear();
     f.close();
     this.codecFactory.release();
   }
@@ -621,6 +657,33 @@ public class ParquetFileReader implements Closeable {
       return offset + length;
     }
 
+  }
+
+  private static final class FooterCacheEntry {
+    private final long modificationTime;
+    private final Map<Path, Footer> footerMap;
+
+    public FooterCacheEntry(FileStatus summaryFileStatus) {
+      this.modificationTime = summaryFileStatus == null ? Long.MIN_VALUE : summaryFileStatus.getModificationTime();
+      footerMap = null;
+    }
+
+    public FooterCacheEntry(FileStatus summaryFileStatus, Map<Path, Footer> footerMap) {
+      this.modificationTime = summaryFileStatus == null ? Long.MIN_VALUE : summaryFileStatus.getModificationTime();
+      this.footerMap = new HashMap<Path, Footer>(footerMap);
+    }
+
+    public boolean isEmpty() {
+      return footerMap == null;
+    }
+
+    public long getModificationTime() {
+      return modificationTime;
+    }
+
+    public Map<Path, Footer> getFooterMap() {
+      return footerMap == null ? Collections.<Path, Footer>emptyMap() : new HashMap<Path, Footer>(footerMap);
+    }
   }
 
 }
