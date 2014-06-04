@@ -335,11 +335,7 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
    * @throws IOException
    */
   public List<Footer> getFooters(JobContext jobContext) throws IOException {
-    if (footers == null) {
-      footers = getFooters(ContextUtil.getConfiguration(jobContext), listStatus(jobContext));
-    }
-
-    return footers;
+    return getFooters(ContextUtil.getConfiguration(jobContext), listStatus(jobContext));
   }
 
   /**
