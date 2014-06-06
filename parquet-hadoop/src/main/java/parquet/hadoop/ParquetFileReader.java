@@ -27,7 +27,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -37,7 +36,6 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
@@ -73,8 +71,6 @@ public class ParquetFileReader implements Closeable {
 
   private static final Log LOG = Log.getLog(ParquetFileReader.class);
 
-  private static final MetadataCache metadataCache = new MetadataCache();
-
   private static ParquetMetadataConverter parquetMetadataConverter = new ParquetMetadataConverter();
 
   /**
@@ -86,7 +82,7 @@ public class ParquetFileReader implements Closeable {
    * @throws IOException
    */
   public static List<Footer> readAllFootersInParallelUsingSummaryFiles(final Configuration configuration, List<FileStatus> partFiles) throws IOException {
-    
+
     // figure out list of all parents to part files
     Set<Path> parents = new HashSet<Path>();
     for (FileStatus part : partFiles) {
@@ -247,12 +243,6 @@ public class ParquetFileReader implements Closeable {
    * @throws IOException if an error occurs while reading the file
    */
   public static final ParquetMetadata readFooter(Configuration configuration, FileStatus file) throws IOException {
-    MetadataCacheEntry cacheEntry = metadataCache.getCurrentEntry(file);
-    if (cacheEntry != null) {
-      if (Log.DEBUG) LOG.debug("returning metadata from cache");
-      return cacheEntry.getMetadata();
-    }
-
     FileSystem fileSystem = file.getPath().getFileSystem(configuration);
     FSDataInputStream f = fileSystem.open(file.getPath());
     try {
@@ -278,9 +268,7 @@ public class ParquetFileReader implements Closeable {
         throw new RuntimeException("corrupted file: the footer index is not within the file");
       }
       f.seek(footerIndex);
-      ParquetMetadata metadata = parquetMetadataConverter.readParquetMetadata(f);
-      metadataCache.put(file.getPath(), new MetadataCacheEntry(file, footerLength, metadata));
-      return metadata;
+      return parquetMetadataConverter.readParquetMetadata(f);
     } finally {
       f.close();
     }
@@ -408,101 +396,6 @@ public class ParquetFileReader implements Closeable {
   public void close() throws IOException {
     f.close();
     this.codecFactory.release();
-  }
-
-  private static final class MetadataCacheEntry {
-    private final long modificationTime;
-    private final long footerLength;
-    private final ParquetMetadata metadata;
-
-    public MetadataCacheEntry(FileStatus summaryFileStatus, long footerLength, ParquetMetadata metadata) {
-      this.modificationTime = extractModificationTime(summaryFileStatus);
-      this.footerLength = footerLength;
-      this.metadata = new ParquetMetadata(metadata.getFileMetaData(), metadata.getBlocks());
-    }
-
-    private long extractModificationTime(FileStatus summaryFileStatus) {
-      return summaryFileStatus == null ? Long.MIN_VALUE : summaryFileStatus.getModificationTime();
-    }
-
-    public long getModificationTime() {
-      return modificationTime;
-    }
-
-    public ParquetMetadata getMetadata() {
-      return new ParquetMetadata(metadata.getFileMetaData(), metadata.getBlocks());
-    }
-
-    public long getFooterLength() {
-      return footerLength;
-    }
-  }
-
-  private static final class MetadataCache {
-    /* Define a soft limit of up to 500 MB of metadata. Note that size here refers to the *on disk* size of the
-     * metadata. The *on disk* size will generally NOT equal the *in-memory* size, but it serves as a convenient proxy
-     * for overall cache size. */
-    private static final int MAX_BYTES_IN_CACHE = 524288000;
-
-    private AtomicLong bytesInCache = new AtomicLong(0);
-
-    private final LinkedHashMap<Path, MetadataCacheEntry> metadataCacheMap =
-            new LinkedHashMap<Path, MetadataCacheEntry>(16, 0.75f, true) {
-
-              @Override
-              public boolean removeEldestEntry(Map.Entry<Path,MetadataCacheEntry> eldest) {
-                if (bytesInCache.get() > MAX_BYTES_IN_CACHE && size() > 1) {
-                  long cacheSize = bytesInCache.addAndGet(-eldest.getValue().getFooterLength());
-                  if (Log.DEBUG) LOG.debug("Removing " + eldest.getValue().getFooterLength() + " bytes from metadata cache. Current metadata cache represents " + cacheSize + " bytes of on disk data");
-                  return true;
-                }
-
-                return false;
-              }
-            };
-
-    public synchronized void remove(Path summaryFile) {
-      MetadataCacheEntry existingEntry = metadataCacheMap.remove(summaryFile);
-      if (existingEntry != null) {
-        long cacheSize = bytesInCache.addAndGet(-existingEntry.getFooterLength());
-        if (Log.DEBUG) LOG.debug("Removing " + existingEntry.getFooterLength() + " bytes from metadata cache. Current metadata cache represents " + cacheSize + " bytes of on disk data");
-      }
-    }
-
-    public synchronized void put(Path summaryFile, MetadataCacheEntry cacheEntry) {
-      MetadataCacheEntry existingEntry = metadataCacheMap.get(summaryFile);
-      long existingEntrySize = 0;
-      if (existingEntry != null) {
-        existingEntrySize = existingEntry.getFooterLength();
-        if (cacheEntry.getModificationTime() < existingEntry.getModificationTime()) {
-          return;
-        }
-      }
-
-      // No cache entry exists or existing entry is stale. Replace entry and update size accordingly.
-      long cacheDelta = cacheEntry.getFooterLength() - existingEntrySize;
-      long cacheSize = bytesInCache.addAndGet(cacheDelta);
-      if (Log.DEBUG) LOG.debug("Adding " + cacheDelta + " bytes to metadata cache. Current metadata cache represents " + cacheSize + " bytes of on disk data");
-      metadataCacheMap.put(summaryFile, cacheEntry);
-    }
-
-    public synchronized void clear() {
-      metadataCacheMap.clear();
-      bytesInCache.set(0);
-    }
-
-    public synchronized MetadataCacheEntry getCurrentEntry(FileStatus summaryFileStatus) {
-      Path summaryFilePath = summaryFileStatus.getPath();
-      MetadataCacheEntry cacheEntry = metadataCacheMap.get(summaryFilePath);
-      if (cacheEntry == null || cacheEntry.getModificationTime() >= summaryFileStatus.getModificationTime()) {
-        return cacheEntry;
-      }
-
-      // Cache entry exists, but it's stale. Remove the existing entry and return null
-      remove(summaryFilePath);
-      return null;
-    }
-
   }
 
 }
