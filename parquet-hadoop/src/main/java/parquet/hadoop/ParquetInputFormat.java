@@ -21,9 +21,11 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.BlockLocation;
@@ -450,32 +452,42 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
 
     Configuration config = ContextUtil.getConfiguration(jobContext);
     List<Footer> footers = new ArrayList<Footer>(statuses.size());
-    Map<Path, FileStatus> missingStatuses = new HashMap<Path, FileStatus>();
+    Set<FileStatus> missingStatuses = new HashSet<FileStatus>();
 
     if (footersCache != null) {
-      for (FileStatus file : statuses) {
-        FootersCacheEntry cacheEntry = footersCache.getCurrentEntry(file.getPath(), config);
-        if (cacheEntry != null) {
-          footers.add(cacheEntry.getFooter());
-        } else {
-          missingStatuses.put(file.getPath(), file);
+        for (FileStatus status : statuses) {
+          FootersCacheEntry cacheEntry = footersCache.getCurrentEntry(status.getPath(), config);
+          if (cacheEntry != null) {
+            footers.add(cacheEntry.getFooter());
+          } else {
+            missingStatuses.add(status);
+          }
         }
-      }
+  	} else {
+      // initialize the cache to store all of the current statuses; this is done mostly to mimic prior behavior
+      footersCache = new FootersCache(footers.size());
+      missingStatuses.addAll(statuses);
     }
-
     if (Log.DEBUG) LOG.debug("found " + footers.size() + " footers in cache and adding up to " +
             missingStatuses.size() + " missing footers to the cache");
 
-    List<Footer> newFooters = getFooters(config, new ArrayList<FileStatus>(missingStatuses.values()));
-    footers.addAll(newFooters);
 
-    if (footersCache == null) {
-      footersCache = new FootersCache(footers.size());
+    if (missingStatuses.isEmpty()) {
+      return footers;
     }
 
+    List<Footer> newFooters = getFooters(config, new ArrayList<FileStatus>(missingStatuses));
+    Map<Path, FileStatus> missingStatusesMap = new HashMap<Path, FileStatus>(missingStatuses.size());
+    for (FileStatus missingStatus : missingStatuses) {
+      missingStatusesMap.put(missingStatus.getPath(), missingStatus);
+    }
     for (Footer newFooter : newFooters) {
-      footersCache.put(newFooter.getFile(), new FootersCacheEntry(missingStatuses.get(newFooter.getFile()), newFooter));
+      // Use the original file status objects to make sure we store a conservative (older) modification time (i.e. in
+      // case the files and footers were modified and it's not clear which version of the footers we have)
+      footersCache.put(new FootersCacheEntry(missingStatusesMap.get(newFooter.getFile()), newFooter));
     }
+
+    footers.addAll(newFooters);
     return footers;
   }
 
@@ -529,36 +541,40 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
       }
       return status.getModificationTime() > entry.status.getModificationTime();
     }
+
+    public Path getPath() {
+      return status.getPath();
+    }
   }
 
   private static final class FootersCache {
-    private final int maxSize;
+    private static float DEFAULT_LOAD_FACTOR = 0.75f;
 
-    public FootersCache(int maxSize) {
-      this.maxSize = maxSize;
+    private final LinkedHashMap<Path, FootersCacheEntry> footersCacheMap;
+
+    public FootersCache(final int maxSize) {
+      footersCacheMap =
+              new LinkedHashMap<Path, FootersCacheEntry>(Math.round(maxSize / DEFAULT_LOAD_FACTOR), DEFAULT_LOAD_FACTOR, true) {
+                @Override
+                public boolean removeEldestEntry(Map.Entry<Path,FootersCacheEntry> eldest) {
+                  return size() > maxSize;
+                }
+              };
     }
-
-    private final LinkedHashMap<Path, FootersCacheEntry> footersCacheMap =
-            new LinkedHashMap<Path, FootersCacheEntry>(16, 0.75f, true) {
-
-              @Override
-              public boolean removeEldestEntry(Map.Entry<Path,FootersCacheEntry> eldest) {
-                return size() > maxSize;
-              }
-            };
 
     public synchronized FootersCacheEntry remove(Path summaryFile) {
       return footersCacheMap.remove(summaryFile);
     }
 
-    public synchronized void put(Path summaryFile, FootersCacheEntry newEntry) {
-      FootersCacheEntry existingEntry = footersCacheMap.get(summaryFile);
+    public synchronized void put(FootersCacheEntry newEntry) {
+      FootersCacheEntry existingEntry = footersCacheMap.get(newEntry.getPath());
       if (existingEntry != null && existingEntry.isNewerThan(newEntry)) {
+        LOG.info("Skipping " + newEntry.getPath());
         return;
       }
 
       // No cache entry exists or existing entry is stale. Replace entry
-      footersCacheMap.put(summaryFile, newEntry);
+      footersCacheMap.put(newEntry.getPath(), newEntry);
     }
 
     public synchronized void clear() {
@@ -576,6 +592,13 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
       return null;
     }
 
+  }
+
+  private static final class FooterComparator implements Comparator<Footer> {
+    @Override
+    public int compare(Footer o1, Footer o2) {
+      return o1.getFile().compareTo(o2.getFile());
+    }
   }
 
 }
