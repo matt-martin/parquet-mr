@@ -18,7 +18,10 @@ package parquet.hadoop;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -77,6 +80,8 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
    * key to configure the filter
    */
   public static final String UNBOUND_RECORD_FILTER = "parquet.read.filter";
+
+  private static final MetadataCache metadataCache = new MetadataCache();
 
   private Class<?> readSupportClass;
 
@@ -438,7 +443,33 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
    * @throws IOException
    */
   public List<Footer> getFooters(JobContext jobContext) throws IOException {
-    return getFooters(ContextUtil.getConfiguration(jobContext), listStatus(jobContext));
+    List<FileStatus> statuses = listStatus(jobContext);
+    if (statuses.isEmpty()) {
+      return Collections.emptyList();
+    }
+
+    Configuration config = ContextUtil.getConfiguration(jobContext);
+    List<Footer> footers = new ArrayList<Footer>(statuses.size());
+    Map<Path, FileStatus> missingStatuses = new HashMap<Path, FileStatus>();
+
+    for (FileStatus file : statuses) {
+      MetadataCacheEntry cacheEntry = metadataCache.getCurrentEntry(file.getPath(), config);
+      if (cacheEntry != null) {
+        footers.add(cacheEntry.getFooter());
+      } else {
+        missingStatuses.put(file.getPath(), file);
+      }
+    }
+
+    if (Log.DEBUG) LOG.debug("found " + footers.size() + " footers in cache and adding up to " +
+            missingStatuses.size() + " missing footers to the cache");
+
+    List<Footer> newFooters = getFooters(config, new ArrayList<FileStatus>(missingStatuses.values()));
+    for (Footer newFooter : newFooters) {
+      metadataCache.put(newFooter.getFile(), new MetadataCacheEntry(missingStatuses.get(newFooter.getFile()), newFooter));
+    }
+    footers.addAll(newFooters);
+    return footers;
   }
 
   /**
@@ -449,7 +480,7 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
    * @throws IOException
    */
   public List<Footer> getFooters(Configuration configuration, List<FileStatus> statuses) throws IOException {
-    LOG.debug("reading " + statuses.size() + " files");
+    if (Log.DEBUG) LOG.debug("reading " + statuses.size() + " files");
     return ParquetFileReader.readAllFootersInParallelUsingSummaryFiles(configuration, statuses);
   }
 
@@ -460,6 +491,80 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
    */
   public GlobalMetaData getGlobalMetaData(JobContext jobContext) throws IOException {
     return ParquetFileWriter.getGlobalMetaData(getFooters(jobContext));
+  }
+
+  private static final class MetadataCacheEntry {
+    private final FileStatus status;
+    private final Footer footer;
+
+    public MetadataCacheEntry(FileStatus status, Footer footer) {
+      this.status = new FileStatus(
+              status.getLen(), status.isDir(), status.getReplication(), status.getModificationTime(),
+              status.getAccessTime(), status.getAccessTime(), status.getPermission(), status.getOwner(),
+              status.getGroup(), status.getPath()
+      );
+      this.footer = new Footer(footer.getFile(), footer.getParquetMetadata());
+    }
+
+    public boolean isEntryCurrent(Configuration configuration) throws IOException {
+      FileSystem fs = footer.getFile().getFileSystem(configuration);
+      FileStatus currentFile = fs.getFileStatus(footer.getFile());
+      return status.getModificationTime() >= currentFile.getModificationTime();
+    }
+
+    public Footer getFooter() {
+      return new Footer(footer.getFile(), footer.getParquetMetadata());
+    }
+
+    public boolean isNewerThan(MetadataCacheEntry entry) {
+      if (entry == null) {
+        return true;
+      }
+      return status.getModificationTime() > entry.status.getModificationTime();
+    }
+  }
+
+  private static final class MetadataCache {
+    private static final int MAX_ENTRIES = 500;
+
+    private final LinkedHashMap<Path, MetadataCacheEntry> metadataCacheMap =
+            new LinkedHashMap<Path, MetadataCacheEntry>(16, 0.75f, true) {
+
+              @Override
+              public boolean removeEldestEntry(Map.Entry<Path,MetadataCacheEntry> eldest) {
+                return size() > MAX_ENTRIES;
+              }
+            };
+
+    public synchronized MetadataCacheEntry remove(Path summaryFile) {
+      return metadataCacheMap.remove(summaryFile);
+    }
+
+    public synchronized void put(Path summaryFile, MetadataCacheEntry newEntry) {
+      MetadataCacheEntry existingEntry = metadataCacheMap.get(summaryFile);
+      if (existingEntry != null && existingEntry.isNewerThan(newEntry)) {
+        return;
+      }
+
+      // No cache entry exists or existing entry is stale. Replace entry
+      metadataCacheMap.put(summaryFile, newEntry);
+    }
+
+    public synchronized void clear() {
+      metadataCacheMap.clear();
+    }
+
+    public synchronized MetadataCacheEntry getCurrentEntry(Path path, Configuration config) throws IOException {
+      MetadataCacheEntry existingEntry = metadataCacheMap.get(path);
+      if (existingEntry == null || existingEntry.isEntryCurrent(config)) {
+        return existingEntry;
+      }
+
+      // Cache entry exists, but it's stale. Remove the existing entry and return null
+      remove(path);
+      return null;
+    }
+
   }
 
 }
