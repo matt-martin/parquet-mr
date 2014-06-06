@@ -465,7 +465,7 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
         }
   	} else {
       // initialize the cache to store all of the current statuses; this is done mostly to mimic prior behavior
-      footersCache = new FootersCache(footers.size());
+      footersCache = new FootersCache(statuses.size());
       missingStatuses.addAll(statuses);
     }
     if (Log.DEBUG) LOG.debug("found " + footers.size() + " footers in cache and adding up to " +
