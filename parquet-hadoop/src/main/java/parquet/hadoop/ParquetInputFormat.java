@@ -81,7 +81,7 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
    */
   public static final String UNBOUND_RECORD_FILTER = "parquet.read.filter";
 
-  private static final MetadataCache metadataCache = new MetadataCache();
+  private FootersCache footersCache;
 
   private Class<?> readSupportClass;
 
@@ -452,12 +452,14 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
     List<Footer> footers = new ArrayList<Footer>(statuses.size());
     Map<Path, FileStatus> missingStatuses = new HashMap<Path, FileStatus>();
 
-    for (FileStatus file : statuses) {
-      MetadataCacheEntry cacheEntry = metadataCache.getCurrentEntry(file.getPath(), config);
-      if (cacheEntry != null) {
-        footers.add(cacheEntry.getFooter());
-      } else {
-        missingStatuses.put(file.getPath(), file);
+    if (footersCache != null) {
+      for (FileStatus file : statuses) {
+        FootersCacheEntry cacheEntry = footersCache.getCurrentEntry(file.getPath(), config);
+        if (cacheEntry != null) {
+          footers.add(cacheEntry.getFooter());
+        } else {
+          missingStatuses.put(file.getPath(), file);
+        }
       }
     }
 
@@ -465,10 +467,15 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
             missingStatuses.size() + " missing footers to the cache");
 
     List<Footer> newFooters = getFooters(config, new ArrayList<FileStatus>(missingStatuses.values()));
-    for (Footer newFooter : newFooters) {
-      metadataCache.put(newFooter.getFile(), new MetadataCacheEntry(missingStatuses.get(newFooter.getFile()), newFooter));
-    }
     footers.addAll(newFooters);
+
+    if (footersCache == null) {
+      footersCache = new FootersCache(footers.size());
+    }
+
+    for (Footer newFooter : newFooters) {
+      footersCache.put(newFooter.getFile(), new FootersCacheEntry(missingStatuses.get(newFooter.getFile()), newFooter));
+    }
     return footers;
   }
 
@@ -493,11 +500,11 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
     return ParquetFileWriter.getGlobalMetaData(getFooters(jobContext));
   }
 
-  private static final class MetadataCacheEntry {
+  private static final class FootersCacheEntry {
     private final FileStatus status;
     private final Footer footer;
 
-    public MetadataCacheEntry(FileStatus status, Footer footer) {
+    public FootersCacheEntry(FileStatus status, Footer footer) {
       this.status = new FileStatus(
               status.getLen(), status.isDir(), status.getReplication(), status.getModificationTime(),
               status.getAccessTime(), status.getAccessTime(), status.getPermission(), status.getOwner(),
@@ -516,7 +523,7 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
       return new Footer(footer.getFile(), footer.getParquetMetadata());
     }
 
-    public boolean isNewerThan(MetadataCacheEntry entry) {
+    public boolean isNewerThan(FootersCacheEntry entry) {
       if (entry == null) {
         return true;
       }
@@ -524,38 +531,42 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
     }
   }
 
-  private static final class MetadataCache {
-    private static final int MAX_ENTRIES = 500;
+  private static final class FootersCache {
+    private final int maxSize;
 
-    private final LinkedHashMap<Path, MetadataCacheEntry> metadataCacheMap =
-            new LinkedHashMap<Path, MetadataCacheEntry>(16, 0.75f, true) {
+    public FootersCache(int maxSize) {
+      this.maxSize = maxSize;
+    }
+
+    private final LinkedHashMap<Path, FootersCacheEntry> footersCacheMap =
+            new LinkedHashMap<Path, FootersCacheEntry>(16, 0.75f, true) {
 
               @Override
-              public boolean removeEldestEntry(Map.Entry<Path,MetadataCacheEntry> eldest) {
-                return size() > MAX_ENTRIES;
+              public boolean removeEldestEntry(Map.Entry<Path,FootersCacheEntry> eldest) {
+                return size() > maxSize;
               }
             };
 
-    public synchronized MetadataCacheEntry remove(Path summaryFile) {
-      return metadataCacheMap.remove(summaryFile);
+    public synchronized FootersCacheEntry remove(Path summaryFile) {
+      return footersCacheMap.remove(summaryFile);
     }
 
-    public synchronized void put(Path summaryFile, MetadataCacheEntry newEntry) {
-      MetadataCacheEntry existingEntry = metadataCacheMap.get(summaryFile);
+    public synchronized void put(Path summaryFile, FootersCacheEntry newEntry) {
+      FootersCacheEntry existingEntry = footersCacheMap.get(summaryFile);
       if (existingEntry != null && existingEntry.isNewerThan(newEntry)) {
         return;
       }
 
       // No cache entry exists or existing entry is stale. Replace entry
-      metadataCacheMap.put(summaryFile, newEntry);
+      footersCacheMap.put(summaryFile, newEntry);
     }
 
     public synchronized void clear() {
-      metadataCacheMap.clear();
+      footersCacheMap.clear();
     }
 
-    public synchronized MetadataCacheEntry getCurrentEntry(Path path, Configuration config) throws IOException {
-      MetadataCacheEntry existingEntry = metadataCacheMap.get(path);
+    public synchronized FootersCacheEntry getCurrentEntry(Path path, Configuration config) throws IOException {
+      FootersCacheEntry existingEntry = footersCacheMap.get(path);
       if (existingEntry == null || existingEntry.isEntryCurrent(config)) {
         return existingEntry;
       }
