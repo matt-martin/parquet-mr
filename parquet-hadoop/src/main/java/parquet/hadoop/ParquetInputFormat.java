@@ -85,7 +85,6 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
   private FootersCache footersCache;
 
   private Class<?> readSupportClass;
-  private List<Footer> footers;
 
   public static void setReadSupportClass(Job job,  Class<?> readSupportClass) {
     ContextUtil.getConfiguration(job).set(READ_SUPPORT_CLASS, readSupportClass.getName());
