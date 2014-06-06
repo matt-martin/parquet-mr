@@ -458,6 +458,7 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
         for (FileStatus status : statuses) {
           FootersCacheEntry cacheEntry = footersCache.getCurrentEntry(status.getPath(), config);
           if (cacheEntry != null) {
+            if (Log.DEBUG) LOG.debug("Found cache entry: " + (cacheEntry == null ? cacheEntry : cacheEntry.getPath()));
             footers.add(cacheEntry.getFooter());
           } else {
             missingStatuses.add(status);
@@ -528,7 +529,9 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
     public boolean isEntryCurrent(Configuration configuration) throws IOException {
       FileSystem fs = footer.getFile().getFileSystem(configuration);
       FileStatus currentFile = fs.getFileStatus(footer.getFile());
-      return status.getModificationTime() >= currentFile.getModificationTime();
+      boolean isCurrent = status.getModificationTime() >= currentFile.getModificationTime();
+      if (Log.DEBUG && !isCurrent) LOG.debug("The cache entry for '" + currentFile.getPath() + "' is not current.");
+      return isCurrent;
     }
 
     public Footer getFooter() {
@@ -536,10 +539,7 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
     }
 
     public boolean isNewerThan(FootersCacheEntry entry) {
-      if (entry == null) {
-        return true;
-      }
-      return status.getModificationTime() > entry.status.getModificationTime();
+      return entry == null || status.getModificationTime() > entry.status.getModificationTime();
     }
 
     public Path getPath() {
@@ -548,32 +548,41 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
   }
 
   private static final class FootersCache {
-    private static float DEFAULT_LOAD_FACTOR = 0.75f;
+    private static final float DEFAULT_LOAD_FACTOR = 0.75f;
+    private static final int MIN_SIZE = 100;
 
     private final LinkedHashMap<Path, FootersCacheEntry> footersCacheMap;
 
-    public FootersCache(final int maxSize) {
+    public FootersCache(int maxSize) {
+      final int actualMax = Math.max(MIN_SIZE, maxSize);
       footersCacheMap =
-              new LinkedHashMap<Path, FootersCacheEntry>(Math.round(maxSize / DEFAULT_LOAD_FACTOR), DEFAULT_LOAD_FACTOR, true) {
+              new LinkedHashMap<Path, FootersCacheEntry>(Math.round(actualMax / DEFAULT_LOAD_FACTOR), DEFAULT_LOAD_FACTOR, true) {
                 @Override
                 public boolean removeEldestEntry(Map.Entry<Path,FootersCacheEntry> eldest) {
-                  return size() > maxSize;
+                  boolean result = size() > actualMax;
+                  if (result && Log.DEBUG) {
+                    LOG.debug("Removing eldest entry in footer cache: " + eldest.getKey());
+                  }
+                  return result;
                 }
               };
     }
 
     public synchronized FootersCacheEntry remove(Path summaryFile) {
-      return footersCacheMap.remove(summaryFile);
+      FootersCacheEntry oldEntry = footersCacheMap.remove(summaryFile);
+      if (oldEntry != null && Log.DEBUG) LOG.debug("Removing cache entry for " + oldEntry.getPath());
+      return oldEntry;
     }
 
     public synchronized void put(FootersCacheEntry newEntry) {
       FootersCacheEntry existingEntry = footersCacheMap.get(newEntry.getPath());
       if (existingEntry != null && existingEntry.isNewerThan(newEntry)) {
-        LOG.info("Skipping " + newEntry.getPath());
+        if (Log.DEBUG) LOG.debug("Ignoring new cache entry for " + newEntry.getPath() + " because existing cache entry is newer");
         return;
       }
 
       // No cache entry exists or existing entry is stale. Replace entry
+      if (Log.DEBUG) LOG.debug("Adding new cache entry for " + newEntry.getPath());
       footersCacheMap.put(newEntry.getPath(), newEntry);
     }
 
@@ -592,13 +601,6 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
       return null;
     }
 
-  }
-
-  private static final class FooterComparator implements Comparator<Footer> {
-    @Override
-    public int compare(Footer o1, Footer o2) {
-      return o1.getFile().compareTo(o2.getFile());
-    }
   }
 
 }
