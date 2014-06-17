@@ -15,6 +15,7 @@
  */
 package parquet.hadoop;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -22,7 +23,6 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -82,7 +82,7 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
    */
   public static final String UNBOUND_RECORD_FILTER = "parquet.read.filter";
 
-  private FootersCache footersCache;
+  private LruCache<Path, FootersCacheEntry> footersCache;
 
   private Class<?> readSupportClass;
 
@@ -301,9 +301,7 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
   private static List<FileStatus> getAllFileRecursively(
       List<FileStatus> files, Configuration conf) throws IOException {
     List<FileStatus> result = new ArrayList<FileStatus>();
-    int len = files.size();
-    for (int i = 0; i < len; ++i) {
-      FileStatus file = files.get(i);
+    for (FileStatus file : files) {
       if (file.isDir()) {
         Path p = file.getPath();
         FileSystem fs = p.getFileSystem(conf);
@@ -352,9 +350,9 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
 
     if (footersCache != null) {
         for (FileStatus status : statuses) {
-          FootersCacheEntry cacheEntry = footersCache.getCurrentEntry(status.getPath(), config);
+          FootersCacheEntry cacheEntry = footersCache.getCurrentEntry(status.getPath());
+          if (Log.DEBUG) LOG.debug("Cache entry " + (cacheEntry == null ? "not " : "") + " found for '" + status.getPath() + "'");
           if (cacheEntry != null) {
-            if (Log.DEBUG) LOG.debug("Found cache entry: " + (cacheEntry == null ? cacheEntry : cacheEntry.getPath()));
             footers.add(cacheEntry.getFooter());
           } else {
             missingStatuses.add(status);
@@ -362,7 +360,7 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
         }
   	} else {
       // initialize the cache to store all of the current statuses; this is done mostly to mimic prior behavior
-      footersCache = new FootersCache(statuses.size());
+      footersCache = new LruCache<Path, FootersCacheEntry>(statuses.size());
       missingStatuses.addAll(statuses);
     }
     if (Log.DEBUG) LOG.debug("found " + footers.size() + " footers in cache and adding up to " +
@@ -380,7 +378,8 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
     for (Footer newFooter : newFooters) {
       // Use the original file status objects to make sure we store a conservative (older) modification time (i.e. in
       // case the files and footers were modified and it's not clear which version of the footers we have)
-      footersCache.put(new FootersCacheEntry(missingStatusesMap.get(newFooter.getFile()), newFooter));
+      FileStatus fileStatus = missingStatusesMap.get(newFooter.getFile());
+      footersCache.put(fileStatus.getPath(), new FootersCacheEntry(fileStatus, newFooter));
     }
 
     footers.addAll(newFooters);
@@ -408,7 +407,7 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
     return ParquetFileWriter.getGlobalMetaData(getFooters(jobContext));
   }
 
-  private static final class FootersCacheEntry {
+  private static final class FootersCacheEntry implements LruCache.Entry<FootersCacheEntry> {
     private final FileStatus status;
     private final Footer footer;
 
@@ -421,9 +420,17 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
       this.footer = new Footer(footer.getFile(), footer.getParquetMetadata());
     }
 
-    public boolean isEntryCurrent(Configuration configuration) throws IOException {
-      FileSystem fs = footer.getFile().getFileSystem(configuration);
-      FileStatus currentFile = fs.getFileStatus(footer.getFile());
+    public boolean isCurrent() {
+      FileSystem fs;
+      FileStatus currentFile;
+      try {
+        fs = footer.getFile().getFileSystem(new Configuration());
+        currentFile = fs.getFileStatus(footer.getFile());
+      } catch (FileNotFoundException e) {
+        return false;
+      } catch (IOException e) {
+        throw new RuntimeException("Exception while checking '" + status.getPath() + "': " + e, e);
+      }
       boolean isCurrent = status.getModificationTime() >= currentFile.getModificationTime();
       if (Log.DEBUG && !isCurrent) LOG.debug("The cache entry for '" + currentFile.getPath() + "' is not current.");
       return isCurrent;
@@ -440,62 +447,6 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
     public Path getPath() {
       return status.getPath();
     }
-  }
-
-  private static final class FootersCache {
-    private static final float DEFAULT_LOAD_FACTOR = 0.75f;
-    private static final int MIN_SIZE = 100;
-
-    private final LinkedHashMap<Path, FootersCacheEntry> footersCacheMap;
-
-    public FootersCache(int maxSize) {
-      final int actualMax = Math.max(MIN_SIZE, maxSize);
-      footersCacheMap =
-              new LinkedHashMap<Path, FootersCacheEntry>(Math.round(actualMax / DEFAULT_LOAD_FACTOR), DEFAULT_LOAD_FACTOR, true) {
-                @Override
-                public boolean removeEldestEntry(Map.Entry<Path,FootersCacheEntry> eldest) {
-                  boolean result = size() > actualMax;
-                  if (result && Log.DEBUG) {
-                    LOG.debug("Removing eldest entry in footer cache: " + eldest.getKey());
-                  }
-                  return result;
-                }
-              };
-    }
-
-    public synchronized FootersCacheEntry remove(Path summaryFile) {
-      FootersCacheEntry oldEntry = footersCacheMap.remove(summaryFile);
-      if (oldEntry != null && Log.DEBUG) LOG.debug("Removing cache entry for " + oldEntry.getPath());
-      return oldEntry;
-    }
-
-    public synchronized void put(FootersCacheEntry newEntry) {
-      FootersCacheEntry existingEntry = footersCacheMap.get(newEntry.getPath());
-      if (existingEntry != null && existingEntry.isNewerThan(newEntry)) {
-        if (Log.DEBUG) LOG.debug("Ignoring new cache entry for " + newEntry.getPath() + " because existing cache entry is newer");
-        return;
-      }
-
-      // No cache entry exists or existing entry is stale. Replace entry
-      if (Log.DEBUG) LOG.debug("Adding new cache entry for " + newEntry.getPath());
-      footersCacheMap.put(newEntry.getPath(), newEntry);
-    }
-
-    public synchronized void clear() {
-      footersCacheMap.clear();
-    }
-
-    public synchronized FootersCacheEntry getCurrentEntry(Path path, Configuration config) throws IOException {
-      FootersCacheEntry existingEntry = footersCacheMap.get(path);
-      if (existingEntry == null || existingEntry.isEntryCurrent(config)) {
-        return existingEntry;
-      }
-
-      // Cache entry exists, but it's stale. Remove the existing entry and return null
-      remove(path);
-      return null;
-    }
-
   }
 
 }
