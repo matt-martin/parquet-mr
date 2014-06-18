@@ -82,6 +82,8 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
    */
   public static final String UNBOUND_RECORD_FILTER = "parquet.read.filter";
 
+  private static final int MIN_FOOTER_CACHE_SIZE = 100;
+
   private LruCache<Path, FootersCacheEntry> footersCache;
 
   private Class<?> readSupportClass;
@@ -359,8 +361,9 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
           }
         }
   	} else {
-      // initialize the cache to store all of the current statuses; this is done mostly to mimic prior behavior
-      footersCache = new LruCache<Path, FootersCacheEntry>(statuses.size());
+      // initialize the cache to store all of the current statuses or a default minimum size. The sizing of this LRU
+      // cache was chosen to mimic prior behavior (i.e. so that performance would be at least as good as it was before)
+      footersCache = new LruCache<Path, FootersCacheEntry>(Math.max(statuses.size(), MIN_FOOTER_CACHE_SIZE));
       missingStatuses.addAll(statuses);
     }
     if (Log.DEBUG) LOG.debug("found " + footers.size() + " footers in cache and adding up to " +
