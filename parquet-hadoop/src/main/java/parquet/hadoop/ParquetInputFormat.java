@@ -408,31 +408,30 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
   }
 
   private static final class FootersCacheEntry implements LruCache.Entry<FootersCacheEntry> {
-    private final FileStatus status;
+    private final long modificationTime;
     private final Footer footer;
 
     public FootersCacheEntry(FileStatus status, Footer footer) {
-      this.status = new FileStatus(
-              status.getLen(), status.isDir(), status.getReplication(), status.getModificationTime(),
-              status.getAccessTime(), status.getAccessTime(), status.getPermission(), status.getOwner(),
-              status.getGroup(), status.getPath()
-      );
+      this.modificationTime = status.getModificationTime();
       this.footer = new Footer(footer.getFile(), footer.getParquetMetadata());
     }
 
     public boolean isCurrent() {
       FileSystem fs;
       FileStatus currentFile;
+      Path path = footer.getFile();
       try {
-        fs = footer.getFile().getFileSystem(new Configuration());
-        currentFile = fs.getFileStatus(footer.getFile());
+        fs = path.getFileSystem(new Configuration());
+        currentFile = fs.getFileStatus(path);
       } catch (FileNotFoundException e) {
+        if (Log.DEBUG) LOG.debug("The '" + path + "' path was not found.");
         return false;
       } catch (IOException e) {
-        throw new RuntimeException("Exception while checking '" + status.getPath() + "': " + e, e);
+        throw new RuntimeException("Exception while checking '" + path + "': " + e, e);
       }
-      boolean isCurrent = status.getModificationTime() >= currentFile.getModificationTime();
-      if (Log.DEBUG && !isCurrent) LOG.debug("The cache entry for '" + currentFile.getPath() + "' is not current.");
+      long currentModTime = currentFile.getModificationTime();
+      boolean isCurrent = modificationTime >= currentModTime;
+      if (Log.DEBUG && !isCurrent) LOG.debug("The cache entry for '" + currentFile.getPath() + "' is not current: cached modification time=" + modificationTime + ", current modification time: " + currentModTime);
       return isCurrent;
     }
 
@@ -441,11 +440,11 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
     }
 
     public boolean isNewerThan(FootersCacheEntry entry) {
-      return entry == null || status.getModificationTime() > entry.status.getModificationTime();
+      return entry == null || modificationTime > entry.modificationTime;
     }
 
     public Path getPath() {
-      return status.getPath();
+      return footer.getFile();
     }
   }
 
