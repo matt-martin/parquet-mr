@@ -515,7 +515,7 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
     return ParquetFileWriter.getGlobalMetaData(getFooters(jobContext));
   }
 
-  private static final class FootersCacheEntry implements LruCache.Entry<FootersCacheEntry> {
+  static final class FootersCacheEntry implements LruCache.Entry<FootersCacheEntry> {
     private final long modificationTime;
     private final Footer footer;
 
@@ -539,12 +539,13 @@ public class ParquetInputFormat<T> extends FileInputFormat<Void, T> {
       }
       long currentModTime = currentFile.getModificationTime();
       boolean isCurrent = modificationTime >= currentModTime;
-      if (Log.DEBUG && !isCurrent) LOG.debug("The cache entry for '" + currentFile.getPath() + "' is not current: cached modification time=" + modificationTime + ", current modification time: " + currentModTime);
+      if (Log.DEBUG && !isCurrent) LOG.debug("The cache entry for '" + currentFile.getPath() + "' is not current: " +
+              "cached modification time=" + modificationTime + ", current modification time: " + currentModTime);
       return isCurrent;
     }
 
     public Footer getFooter() {
-      return new Footer(footer.getFile(), footer.getParquetMetadata());
+      return footer;
     }
 
     public boolean isNewerThan(FootersCacheEntry entry) {
