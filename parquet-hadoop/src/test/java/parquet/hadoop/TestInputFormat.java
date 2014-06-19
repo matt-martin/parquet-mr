@@ -254,13 +254,6 @@ public class TestInputFormat {
     FileSystem fs = FileSystem.getLocal(new Configuration());
     ParquetInputFormat.FootersCacheEntry cacheEntry = getDummyCacheEntry(tempFile, fs);
 
-    // wait one second and then access the file to change the access time (we have to wait at least a second to make
-    // sure the underlying system can register the difference.
-    Thread.sleep(1000);
-    BufferedReader br = new BufferedReader(new InputStreamReader(fs.open(new Path(tempFile.getPath()))));
-    while (br.readLine() != null) { }
-    assertTrue(cacheEntry.isCurrent());
-
     assertTrue(tempFile.setLastModified(tempFile.lastModified() + 5000));
     assertFalse(cacheEntry.isCurrent());
   }
