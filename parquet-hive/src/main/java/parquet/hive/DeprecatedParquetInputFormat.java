@@ -229,9 +229,9 @@ public class DeprecatedParquetInputFormat extends FileInputFormat<Void, ArrayWri
       } else {
         realReader = null;
         eof = true;
-        if (valueObj == null) { // Should initialize the value for createValue
-          valueObj = new ArrayWritable(Writable.class, new Writable[schemaSize]);
-        }
+      }
+      if (valueObj == null) { // Should initialize the value for createValue
+        valueObj = new ArrayWritable(Writable.class, new Writable[schemaSize]);
       }
     }
 
